@@ -162,10 +162,19 @@ def _worker(args, chunk_index, trajectory_count, state_dir, result_path, run_tag
     """One isolated chunk worker; process exit releases all host/GPU memory."""
     np.random.seed(args.seed + chunk_index)
     tf.random.set_seed(args.seed + chunk_index)
-    train_trajectories, centers, train_records = generate_online_goal_chunk(
+    compiled_data = getattr(args, "cloud_data_mode", "legacy") == "compiled"
+    if compiled_data:
+        from runtime.cloud_compiled_2d import (
+            generate_compiled_online_goal_chunk,
+        )
+
+        generator = generate_compiled_online_goal_chunk
+    else:
+        generator = generate_online_goal_chunk
+    train_trajectories, centers, train_records = generator(
         args, chunk_index, trajectory_count
     )
-    validation_trajectories, _, validation_records = generate_online_goal_chunk(
+    validation_trajectories, _, validation_records = generator(
         args, chunk_index, args.va_set_size, validation=True
     )
 
@@ -176,7 +185,16 @@ def _worker(args, chunk_index, trajectory_count, state_dir, result_path, run_tag
             f"--batch_size {args.batch_size} must be divisible by {replicas} GPUs."
         )
     per_replica_batch = args.batch_size // replicas
-    train_data, train_steps = dataset_from_trajectories(
+    dataset_builder = dataset_from_trajectories
+    dataset_keywords = {}
+    if compiled_data:
+        from runtime.cloud_bitpacked_2d import (
+            dataset_from_bitpacked_trajectories,
+        )
+
+        dataset_builder = dataset_from_bitpacked_trajectories
+        dataset_keywords = {"goal_conditioned": True}
+    train_data, train_steps = dataset_builder(
         train_trajectories,
         per_replica_batch,
         args.n_boids,
@@ -184,8 +202,9 @@ def _worker(args, chunk_index, trajectory_count, state_dir, result_path, run_tag
         args.near_goal_radius,
         args.seed + chunk_index,
         shuffle_batches=True,
+        **dataset_keywords,
     )
-    validation_data, validation_steps = dataset_from_trajectories(
+    validation_data, validation_steps = dataset_builder(
         validation_trajectories,
         per_replica_batch,
         args.n_boids,
@@ -193,6 +212,7 @@ def _worker(args, chunk_index, trajectory_count, state_dir, result_path, run_tag
         args.near_goal_radius,
         args.seed + 50_000_021 + chunk_index,
         shuffle_batches=False,
+        **dataset_keywords,
     )
 
     with strategy.scope():
@@ -276,6 +296,8 @@ def validate_online_cloud_args(args):
         raise ValueError(
             "The online_goals task currently requires --backend cloud."
         )
+    if getattr(args, "cloud_data_mode", "legacy") not in ("legacy", "compiled"):
+        raise ValueError("--cloud_data_mode must be legacy or compiled.")
     if args.boids_cache:
         raise ValueError("Online cloud mode is cacheless; omit --boids_cache.")
     if args.tr_set_repeats != 1:
@@ -338,6 +360,10 @@ def train_online_goal_cloud(args):
         f"exactly 2 goals/episode, {chunks} isolated chunks, no data cache.",
         flush=True,
     )
+    print(
+        f">>> Cloud data mode: {getattr(args, 'cloud_data_mode', 'legacy')}",
+        flush=True,
+    )
     all_results = []
     with tempfile.TemporaryDirectory(prefix="gnca_2d_online_cloud_") as temp_dir:
         state_dir = os.path.join(temp_dir, "training_state")
@@ -394,6 +420,7 @@ def train_online_goal_cloud(args):
         "waypoints_per_episode": 2,
         "cacheless": True,
         "backend": "cloud",
+        "cloud_data_mode": getattr(args, "cloud_data_mode", "legacy"),
         "goal_bounds": list(args.goal_bounds),
         "start_bounds": list(args.start_bounds),
         "goal_min_distance": args.goal_min_distance,

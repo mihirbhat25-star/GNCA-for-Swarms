@@ -1,4 +1,4 @@
-"""Bit-packed, lazy dataset adapter for the 3D cloud backend.
+"""Bit-packed, lazy dataset adapter for 2D and 3D cloud backends.
 
 This module changes only how generated expert data is represented and batched.
 The resulting model inputs are the same disjoint ``tf.SparseTensor`` contract
@@ -67,13 +67,15 @@ def _trajectory_arrays(trajectory, goal_conditioned):
     )
 
 
-def _selected_steps(states, active_goals, timestep_stride, near_goal_radius):
+def _selected_steps(
+    states, active_goals, timestep_stride, near_goal_radius, spatial_dims
+):
     """Return the timesteps selected by the established stride policy."""
     n_steps = len(active_goals)
     if timestep_stride <= 1 or near_goal_radius <= 0:
         return np.arange(0, n_steps, timestep_stride, dtype=np.int32)
 
-    mean_pos = states[:-1, :, :3].mean(axis=1)
+    mean_pos = states[:-1, :, :spatial_dims].mean(axis=1)
     distance = np.linalg.norm(mean_pos - active_goals, axis=-1)
     keep = np.zeros(n_steps, dtype=bool)
     keep[::timestep_stride] = True
@@ -87,6 +89,7 @@ def _flatten_sources(
     timestep_stride,
     near_goal_radius,
     goal_conditioned,
+    spatial_dims,
 ):
     """Flatten trajectories once without materializing duplicated x/y batches."""
     if not trajectories:
@@ -107,21 +110,29 @@ def _flatten_sources(
             adjacency_bits,
         ) = _trajectory_arrays(trajectory, goal_conditioned)
         expected_steps = len(states) - 1
-        if states.ndim != 3 or states.shape[1:] != (n_boids, 6):
+        physical_features = 2 * spatial_dims
+        if states.ndim != 3 or states.shape[1:] != (
+            n_boids,
+            physical_features,
+        ):
             raise ValueError(
                 f"Trajectory {trajectory_idx} has states shape {states.shape}; "
-                f"expected (steps + 1, {n_boids}, 6)."
+                f"expected (steps + 1, {n_boids}, {physical_features})."
             )
-        if active_goals.shape != (expected_steps, 3):
+        if active_goals.shape != (expected_steps, spatial_dims):
             raise ValueError(
                 f"Trajectory {trajectory_idx} has active-goal shape "
                 f"{active_goals.shape}; "
-                f"expected ({expected_steps}, 3)."
+                f"expected ({expected_steps}, {spatial_dims})."
             )
-        if goal_conditioned and previous_goals.shape != (expected_steps, 3):
+        if goal_conditioned and previous_goals.shape != (
+            expected_steps,
+            spatial_dims,
+        ):
             raise ValueError(
                 f"Trajectory {trajectory_idx} has previous-goal shape "
-                f"{previous_goals.shape}; expected ({expected_steps}, 3)."
+                f"{previous_goals.shape}; expected "
+                f"({expected_steps}, {spatial_dims})."
             )
         if goal_conditioned and max_previous_distances.shape != (expected_steps,):
             raise ValueError(
@@ -140,6 +151,7 @@ def _flatten_sources(
             active_goals,
             timestep_stride,
             near_goal_radius,
+            spatial_dims,
         )
         trajectory_arrays.append((
             states,
@@ -153,12 +165,14 @@ def _flatten_sources(
         total_samples += len(selected)
 
     states_flat = np.empty(
-        (total_states, n_boids, 6), dtype=np.float32
+        (total_states, n_boids, 2 * spatial_dims), dtype=np.float32
     )
     current_state_ids = np.empty(total_samples, dtype=np.int32)
-    active_goals_flat = np.empty((total_samples, 3), dtype=np.float32)
+    active_goals_flat = np.empty(
+        (total_samples, spatial_dims), dtype=np.float32
+    )
     previous_goals_flat = (
-        np.empty((total_samples, 3), dtype=np.float32)
+        np.empty((total_samples, spatial_dims), dtype=np.float32)
         if goal_conditioned
         else None
     )
@@ -258,6 +272,7 @@ def _make_model_batch(
     batch_size,
     n_boids,
     goal_conditioned,
+    spatial_dims,
 ):
     """Gather x/y lazily and decode one bit-packed disjoint graph batch."""
     sample_ids = tf.ensure_shape(sample_ids, [batch_size])
@@ -268,13 +283,18 @@ def _make_model_batch(
     batch_adjacency_bits = tf.gather(adjacency_bits, sample_ids)
 
     active_goal_broadcast = tf.broadcast_to(
-        batch_active_goals[:, None, :], [batch_size, n_boids, 3]
+        batch_active_goals[:, None, :],
+        [batch_size, n_boids, spatial_dims],
     )
+    physical_features = 2 * spatial_dims
     if goal_conditioned:
-        goal_vectors = active_goal_broadcast - current_states[..., :3]
+        goal_vectors = (
+            active_goal_broadcast - current_states[..., :spatial_dims]
+        )
         batch_previous_goals = tf.gather(previous_goals, sample_ids)
         previous_goal_broadcast = tf.broadcast_to(
-            batch_previous_goals[:, None, :], [batch_size, n_boids, 3]
+            batch_previous_goals[:, None, :],
+            [batch_size, n_boids, spatial_dims],
         )
         batch_previous_distances = tf.gather(
             max_previous_distances, sample_ids
@@ -285,7 +305,7 @@ def _make_model_batch(
         )
         x = tf.reshape(
             tf.concat((current_states, goal_vectors), axis=-1),
-            [batch_size * n_boids, 9],
+            [batch_size * n_boids, 3 * spatial_dims],
         )
         y = tf.reshape(
             tf.concat(
@@ -298,20 +318,23 @@ def _make_model_batch(
                 ),
                 axis=-1,
             ),
-            [batch_size * n_boids, 19],
+            [batch_size * n_boids, 6 * spatial_dims + 1],
         )
-        input_width = 9
-        target_width = 20
+        input_width = 3 * spatial_dims
+        target_width = 6 * spatial_dims + 2
     else:
-        x = tf.reshape(current_states, [batch_size * n_boids, 6])
+        x = tf.reshape(
+            current_states,
+            [batch_size * n_boids, physical_features],
+        )
         y = tf.reshape(
             tf.concat(
                 (current_states, next_states, active_goal_broadcast), axis=-1
             ),
-            [batch_size * n_boids, 15],
+            [batch_size * n_boids, 5 * spatial_dims],
         )
-        input_width = 6
-        target_width = 16
+        input_width = physical_features
+        target_width = 5 * spatial_dims + 1
 
     indices = _decode_disjoint_indices(batch_adjacency_bits, n_boids)
     n_nodes = batch_size * n_boids
@@ -346,6 +369,7 @@ def dataset_from_bitpacked_trajectories(
     *,
     shuffle_batches=True,
     goal_conditioned=False,
+    spatial_dims=3,
 ):
     """Create a native dataset from compact states and bit-packed graphs.
 
@@ -356,6 +380,9 @@ def dataset_from_bitpacked_trajectories(
     pack_t0 = time.time()
     batch_size = int(batch_size)
     n_boids = int(n_boids)
+    spatial_dims = int(spatial_dims)
+    if spatial_dims not in (2, 3):
+        raise ValueError("spatial_dims must be 2 or 3.")
     (
         states,
         current_state_ids,
@@ -369,6 +396,7 @@ def dataset_from_bitpacked_trajectories(
         timestep_stride,
         near_goal_radius,
         goal_conditioned,
+        spatial_dims,
     )
 
     rng = np.random.default_rng(seed)
@@ -410,6 +438,7 @@ def dataset_from_bitpacked_trajectories(
             batch_size,
             n_boids,
             goal_conditioned,
+            spatial_dims,
         ),
         num_parallel_calls=tf.data.AUTOTUNE,
         deterministic=False,

@@ -394,6 +394,15 @@ parser.add_argument(
         "the existing fixed-waypoint pipeline remains local."
     ),
 )
+parser.add_argument(
+    "--cloud_data_mode",
+    choices=["legacy", "compiled"],
+    default="legacy",
+    help=(
+        "Cloud-only data path. 'compiled' uses Numba expert rollouts and "
+        "lazy bit-packed adjacency; it does not change the GNCA architecture."
+    ),
+)
 parser.add_argument("--lr", default=1e-3, type=float, help="Initial LR")
 parser.add_argument(
     "--batch_size", default=30, type=int, help="Size of the mini-batches"
